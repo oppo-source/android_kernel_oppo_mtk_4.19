@@ -738,12 +738,29 @@ static void fbt_set_idleprefer_locked(int enable)
 
 static void fbt_set_down_throttle_locked(int nsec)
 {
+	if (!fbt_down_throttle_enable)
+		return;
 
+	if (down_throttle_ns == nsec)
+		return;
+
+	xgf_trace("fpsgo set down_throttle %d", nsec);
+	update_schedplus_down_throttle_ns(EAS_THRES_KIR_FPSGO, nsec);
+	update_schedplus_up_throttle_ns(EAS_THRES_KIR_FPSGO, nsec);
+	down_throttle_ns = nsec;
 }
 
 static void fbt_set_sync_flag_locked(int input)
 {
+	if (!fbt_sync_flag_enable)
+		return;
 
+	if (sync_flag == input)
+		return;
+
+	xgf_trace("fpsgo set sync_flag %d", input);
+	update_schedplus_sync_flag(EAS_SYNC_FLAG_KIR_FPSGO, input);
+	sync_flag = input;
 }
 
 static void fbt_set_ultra_rescue_locked(int input)
@@ -2490,7 +2507,7 @@ static int fbt_get_next_jerk(int cur_id)
 
 int update_quota(struct fbt_boost_info *boost_info, int target_fps,
 	unsigned long long t_Q2Q_ns, unsigned long long t_enq_len_ns,
-	unsigned long long t_deq_len_ns)
+	unsigned long long t_deq_len_ns, int cooler_on)
 {
 	int rm_idx, new_idx, first_idx;
 	long long target_time = div64_s64(100000000, target_fps * 100 + gcc_fps_margin);
@@ -2509,7 +2526,7 @@ int update_quota(struct fbt_boost_info *boost_info, int target_fps,
 
 	s32_target_time = target_time;
 
-	if (target_fps != boost_info->quota_fps) {
+	if (target_fps != boost_info->quota_fps && !cooler_on) {
 		boost_info->quota_cur_idx = -1;
 		boost_info->quota_cnt = 0;
 		boost_info->quota = 0;
@@ -2630,7 +2647,7 @@ int update_quota(struct fbt_boost_info *boost_info, int target_fps,
 
 int fbt_eva_gcc(struct fbt_boost_info *boost_info,
 		int target_fps, int fps_margin, unsigned long long t_Q2Q,
-		unsigned int gpu_loading, int pct, int blc_wt, long long t_cpu)
+		unsigned int gpu_loading, int pct, int blc_wt, long long t_cpu, int cooler_on)
 {
 	long long target_time = div64_s64(100000000, target_fps * 100 + gcc_fps_margin);
 	int gcc_down_window, gcc_up_window;
@@ -2661,7 +2678,7 @@ int fbt_eva_gcc(struct fbt_boost_info *boost_info,
 	}
 
 
-	if (boost_info->gcc_target_fps != target_fps) {
+	if (boost_info->gcc_target_fps != target_fps && !cooler_on) {
 		boost_info->gcc_target_fps = target_fps;
 		boost_info->correction = 0;
 		boost_info->gcc_count = 1;
@@ -2813,7 +2830,7 @@ static int fbt_boost_policy(
 	unsigned int fps_margin,
 	struct render_info *thread_info,
 	unsigned long long ts,
-	long aa)
+	long aa, int cooler_on)
 {
 	unsigned int blc_wt = 0U;
 	unsigned long long temp_blc;
@@ -2897,7 +2914,7 @@ static int fbt_boost_policy(
 				target_fps,
 				thread_info->Q2Q_time,
 				thread_info->enqueue_length,
-				thread_info->dequeue_length);
+				thread_info->dequeue_length, cooler_on);
 
 		if (qr_debug)
 			fpsgo_systrace_c_fbt(pid, buffer_id, boost_info->quota, "quota");
@@ -2916,7 +2933,8 @@ static int fbt_boost_policy(
 		gcc_boost = fbt_eva_gcc(
 				boost_info,
 				target_fps, fps_margin,
-				thread_info->Q2Q_time, gpu_loading, pct, blc_wt, t_cpu_cur);
+				thread_info->Q2Q_time, gpu_loading,
+				pct, blc_wt, t_cpu_cur, cooler_on);
 		fpsgo_systrace_c_fbt(pid, buffer_id, boost_info->gcc_count, "gcc_count");
 		fpsgo_systrace_c_fbt(pid, buffer_id, gcc_boost, "gcc_boost");
 		fpsgo_systrace_c_fbt(pid, buffer_id, boost_info->correction, "correction");
@@ -3375,7 +3393,7 @@ static void fbt_frame_start(struct render_info *thr, unsigned long long ts)
 {
 	struct fbt_boost_info *boost;
 	long long runtime;
-	int targettime, targetfps, fps_margin;
+	int targettime, targetfps, fps_margin, cooler_on;
 	unsigned int limited_cap = 0;
 	int blc_wt = 0;
 	long loading = 0L;
@@ -3391,7 +3409,7 @@ static void fbt_frame_start(struct render_info *thr, unsigned long long ts)
 
 	fpsgo_fbt2fstb_query_fps(thr->pid, thr->buffer_id,
 			&targetfps, &targettime, &fps_margin, thr->tgid, thr->mid,
-			&q_c_time, &q_g_time);
+			&q_c_time, &q_g_time, &cooler_on);
 	boost->quantile_cpu_time = q_c_time;
 	boost->quantile_gpu_time = q_g_time;
 	if (!targetfps)
@@ -3414,7 +3432,7 @@ static void fbt_frame_start(struct render_info *thr, unsigned long long ts)
 
 	blc_wt = fbt_boost_policy(runtime,
 			targettime, targetfps, fps_margin,
-			thr, ts, loading);
+			thr, ts, loading, cooler_on);
 
 	limited_cap = fbt_get_max_userlimit_freq();
 	fpsgo_systrace_c_fbt(thr->pid, thr->buffer_id,
@@ -4094,8 +4112,6 @@ static void fbt_update_pwd_tbl(void)
 {
 	int cluster, opp;
 	unsigned int max_cap = 0, min_cap = UINT_MAX;
-	unsigned long long cap_orig = 0ULL;
-	unsigned long long cap = 0ULL;
 	struct cpumask max_cluster_cpu, online_cpu;
 
 	for (cluster = 0; cluster < cluster_num ; cluster++) {
@@ -4103,20 +4119,19 @@ static void fbt_update_pwd_tbl(void)
 
 		for_each_possible_cpu(cpu) {
 			if (arch_cpu_cluster_id(cpu) == cluster)
-				cap_orig = capacity_orig_of(cpu);
+				break;
 		}
 
 
 		for (opp = 0; opp < NR_FREQ_CPU; opp++) {
+			unsigned long long cap = 0ULL;
 			unsigned int temp;
 
 			cpu_dvfs[cluster].power[opp] =
 				mt_cpufreq_get_freq_by_idx(cluster, opp);
 
-			cap = cap_orig * cpu_dvfs[cluster].power[opp];
-			if (cpu_dvfs[cluster].power[0])
-				do_div(cap, cpu_dvfs[cluster].power[0]);
-
+			cap =
+			upower_get_core_tbl(cpu)->row[NR_FREQ_CPU - opp - 1].cap;
 
 			cap = (cap * 100) >> 10;
 			temp = (unsigned int)cap;
